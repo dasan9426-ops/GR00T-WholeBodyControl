@@ -65,6 +65,12 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <thread>
+#include <atomic>
+// UDP socket for music sync
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -214,7 +220,165 @@ class G1Deploy {
     int current_frame_ = 0;
     int saved_frame_for_observation_window_ = 0; // for observation window
     std::mutex current_motion_mutex_; // for current motion and frame synchronization
-    
+
+    // =========================================================================
+    // Music sync: frame speed adjustment via accumulator
+    // frame_step_ = 1.0 → normal speed
+    //             > 1.0 → slightly faster (catching up)
+    //             < 1.0 → slightly slower (holding back)
+    // Clamped to [0.95, 1.05] for safety.
+    //
+    // Protocol (UDP, port 54321):
+    //   "START"              → reset frame/accumulator, begin playback
+    //   "BEAT <elapsed_sec>" → checkpoint: recalculate frame_step_
+    //   "STOP"               → reset to normal speed
+    // =========================================================================
+    double frame_accumulator_ = 0.0;  ///< Fractional frame remainder
+    double frame_step_ = 1.0;         ///< Frame advance per control cycle
+    static constexpr double kFrameStepMin = 0.95;
+    static constexpr double kFrameStepMax = 1.05;
+    static constexpr int    kMusicSyncPort   = 54321;
+    static constexpr int    kStopSignalPort  = 9876;   ///< UDP port for external stop signal
+    static constexpr int    kControlHz       = 50;     ///< Control thread frequency
+
+    // Music sync state
+    std::atomic<bool>   music_sync_running_{false};
+    std::thread         music_sync_thread_;
+    std::mutex          music_sync_mutex_;
+    double              music_start_time_  = 0.0;  ///< steady_clock epoch when START received
+    int                 beat_count_        = 0;     ///< Number of beats received so far
+    double              beat_interval_sec_ = 0.5;  ///< Seconds between beats (set on first BEAT)
+
+    // External stop signal state (UDP port 9876)
+    std::atomic<bool>   stop_signal_running_{false};
+    std::atomic<bool>   stop_signal_requested_{false};
+    std::thread         stop_signal_thread_;
+
+    /// Clamp frame_step_ to safe range (call under music_sync_mutex_)
+    void SetFrameStep(double step) {
+      frame_step_ = std::clamp(step, kFrameStepMin, kFrameStepMax);
+    }
+
+    /// Background thread: receive UDP music-sync commands and update frame_step_
+    void MusicSyncLoop() {
+      int sock = socket(AF_INET, SOCK_DGRAM, 0);
+      if (sock < 0) {
+        std::cerr << "[MusicSync] Failed to create socket" << std::endl;
+        return;
+      }
+      // Allow reuse and set receive timeout
+      int opt = 1;
+      setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      struct timeval tv{1, 0};
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+      sockaddr_in addr{};
+      addr.sin_family      = AF_INET;
+      addr.sin_port        = htons(kMusicSyncPort);
+      addr.sin_addr.s_addr = INADDR_ANY;
+      if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "[MusicSync] Failed to bind port " << kMusicSyncPort << std::endl;
+        close(sock);
+        return;
+      }
+      std::cout << "[MusicSync] Listening on UDP port " << kMusicSyncPort << std::endl;
+
+      char buf[256];
+      while (music_sync_running_.load()) {
+        ssize_t len = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (len <= 0) continue;  // timeout or error → retry
+        buf[len] = '\0';
+        std::string msg(buf);
+
+        if (msg == "START") {
+          // Reset frame and start music clock
+          std::lock_guard<std::mutex> lk(music_sync_mutex_);
+          music_start_time_ = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+          beat_count_ = 0;
+          frame_accumulator_ = 0.0;
+          frame_step_        = 1.0;
+          std::cout << "[MusicSync] START received – clock reset" << std::endl;
+
+        } else if (msg.rfind("BEAT ", 0) == 0) {
+          // "BEAT <elapsed_sec_of_beat>" from music PC
+          double beat_elapsed = std::stod(msg.substr(5));
+          std::lock_guard<std::mutex> lk(music_sync_mutex_);
+          beat_count_++;
+
+          // Update beat interval estimate from first two beats
+          if (beat_count_ == 1) {
+            beat_interval_sec_ = beat_elapsed;
+          } else {
+            beat_interval_sec_ = beat_elapsed / beat_count_;
+          }
+
+          // Expected frame at this beat
+          int frames_per_beat   = static_cast<int>(std::round(beat_interval_sec_ * kControlHz));
+          int expected_frame    = beat_count_ * frames_per_beat;
+          int actual_frame      = current_frame_;
+          int diff              = actual_frame - expected_frame;  // + = ahead, - = behind
+
+          // How many frames needed to reach next beat target
+          int next_expected      = (beat_count_ + 1) * frames_per_beat;
+          int frames_needed      = next_expected - actual_frame;
+          double new_step        = static_cast<double>(frames_needed) / frames_per_beat;
+          SetFrameStep(new_step);
+
+          std::cout << "[MusicSync] BEAT " << beat_count_
+                    << " | frame=" << actual_frame
+                    << " expect=" << expected_frame
+                    << " diff=" << diff
+                    << " next_target=" << next_expected
+                    << " step=" << frame_step_ << std::endl;
+
+        } else if (msg == "STOP") {
+          std::lock_guard<std::mutex> lk(music_sync_mutex_);
+          frame_step_ = 1.0;
+          std::cout << "[MusicSync] STOP received – speed reset to 1.0" << std::endl;
+        }
+      }
+      close(sock);
+    }
+
+    /// Background thread: receive UDP stop signal and set stop_signal_requested_
+    /// Send any message to UDP port 9876 to stop motion playback.
+    /// Example: echo -n "STOP" | nc -u -w1 127.0.0.1 9876
+    void StopSignalLoop() {
+      int sock = socket(AF_INET, SOCK_DGRAM, 0);
+      if (sock < 0) {
+        std::cerr << "[StopSignal] Failed to create socket" << std::endl;
+        return;
+      }
+      int opt = 1;
+      setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      struct timeval tv{0, 50000};  // 50ms timeout for clean shutdown
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+      sockaddr_in addr{};
+      addr.sin_family      = AF_INET;
+      addr.sin_port        = htons(kStopSignalPort);
+      addr.sin_addr.s_addr = INADDR_ANY;
+      if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "[StopSignal] Failed to bind port " << kStopSignalPort << std::endl;
+        close(sock);
+        return;
+      }
+      std::cout << "[StopSignal] Listening on UDP port " << kStopSignalPort << std::endl;
+      std::cout << "[StopSignal] Send any UDP message to stop motion playback." << std::endl;
+      std::cout << "[StopSignal] Example: echo -n \"STOP\" | nc -u -w1 127.0.0.1 " << kStopSignalPort << std::endl;
+
+      char buf[64];
+      while (stop_signal_running_.load()) {
+        ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0, nullptr, nullptr);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+        std::cout << "[StopSignal] Received '" << buf << "' -> stopping motion" << std::endl;
+        stop_signal_requested_.store(true);
+      }
+      close(sock);
+    }
+
     // =========================================================================
     // Local motion planner and movement state
     // =========================================================================
@@ -2584,7 +2748,15 @@ class G1Deploy {
         planner_thread_ptr_ =
           CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
       }
-          
+
+      // Start music sync UDP listener
+      music_sync_running_.store(true);
+      music_sync_thread_ = std::thread(&G1Deploy::MusicSyncLoop, this);
+
+      // Start external stop signal UDP listener
+      stop_signal_running_.store(true);
+      stop_signal_thread_ = std::thread(&G1Deploy::StopSignalLoop, this);
+
       SetThreadPriority();
     }
 
@@ -2682,6 +2854,18 @@ class G1Deploy {
     /// Gracefully stop all threads and send a damping-only command.
     void Stop() {
       operator_state.stop = true;
+
+      // Stop music sync thread
+      music_sync_running_.store(false);
+      if (music_sync_thread_.joinable()) {
+        music_sync_thread_.join();
+      }
+
+      // Stop external stop signal thread
+      stop_signal_running_.store(false);
+      if (stop_signal_thread_.joinable()) {
+        stop_signal_thread_.join();
+      }
 
       if (control_thread_ptr_) {
         input_thread_ptr_->Wait();
@@ -3370,8 +3554,11 @@ class G1Deploy {
       // Update motion frame playback for non-planner motion
       bool use_planner_motion = (current_motion_ && current_motion_ == planner_motion_);
       if (!use_planner_motion && current_motion_ && current_motion_->timesteps > 0 && operator_state.play) {
-        // Update display motion current frame
-        current_frame_++;
+        // Update display motion current frame (music-sync accumulator × user speed scale)
+        frame_accumulator_ += frame_step_ * input_interface_->GetMotionSpeedScale();
+        int advance = static_cast<int>(frame_accumulator_);
+        frame_accumulator_ -= static_cast<double>(advance);
+        current_frame_ += advance;
         // Check if motion completed (reached the end)
         if (current_motion_->name != "streamed") {
           if (current_frame_ >= current_motion_->timesteps) {
@@ -3384,6 +3571,8 @@ class G1Deploy {
               std::cout << "Temporary motion completed." << std::endl;
             }
             current_frame_ = 0; // Reset to beginning
+            frame_accumulator_ = 0.0; // Reset accumulator
+            frame_step_ = 1.0;        // Reset speed to normal
             // Total reset: both base quaternion and delta heading
             reinitialize_heading_ = true;
             std::cout << "Reset to frame 0." << std::endl;
@@ -3897,7 +4086,17 @@ class G1Deploy {
             return;
           }
 
-          
+          // Handle external UDP stop signal
+          if (stop_signal_requested_.exchange(false)) {
+            std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            operator_state.play = false;
+            current_frame_ = 0;
+            frame_accumulator_ = 0.0;
+            reinitialize_heading_ = true;
+            std::cout << "[StopSignal] Motion stopped and reset to frame 0." << std::endl;
+          }
+
+
           // Lock mutex for observation gathering and output sending to ensure consistency
           // This ensures all observations use the same snapshot of current_motion_ and current_frame_
           int current_frame_copy;

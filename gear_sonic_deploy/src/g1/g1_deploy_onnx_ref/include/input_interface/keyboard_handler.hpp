@@ -317,6 +317,8 @@ class SimpleKeyboard : public InputInterface {
             case 'Z': encoder_mode_toggle = true; break; // Toggle encoder mode
             case 'h':
             case 'H': report_temperature = true; break; // Report motor temperatures
+            case '[': AdjustMotionSpeedScale(-0.1); break; // Decrease motion speed
+            case '\\': AdjustMotionSpeedScale(0.1); break; // Increase motion speed
           }
         }
         

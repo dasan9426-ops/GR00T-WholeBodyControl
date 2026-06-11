@@ -262,6 +262,13 @@ class InterfaceManager : public InputInterface {
       return InputInterface::GetExternalTokenState();  // Fallback to base class
     }
 
+    double GetMotionSpeedScale() const override {
+      if (current_) {
+        return current_->GetMotionSpeedScale();
+      }
+      return InputInterface::GetMotionSpeedScale();  // Fallback to base class
+    }
+
     /// Forward raw wireless-remote byte buffer to the internal Gamepad instance.
     /// Called by the Unitree SDK callback whenever new joystick data arrives.
     void UpdateGamepadRemoteData(const uint8_t* buff, size_t size) {

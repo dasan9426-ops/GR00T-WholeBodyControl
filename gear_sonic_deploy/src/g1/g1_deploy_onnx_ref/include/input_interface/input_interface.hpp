@@ -275,8 +275,29 @@ public:
     virtual void AdjustMaxCloseRatio(double delta) {
         double new_val = std::clamp(max_close_ratio_.load(std::memory_order_relaxed) + delta, 0.2, 1.0);
         max_close_ratio_.store(new_val, std::memory_order_relaxed);
-        std::cout << "[InputInterface] Max close ratio adjusted to: " << new_val 
+        std::cout << "[InputInterface] Max close ratio adjusted to: " << new_val
                   << " (range: 0.2-1.0, higher = more closed)" << std::endl;
+    }
+
+    // =========================================================================
+    // Motion speed scale control (keyboard-controlled via [ / \ keys)
+    // Controls reference motion playback speed (0.1x slow .. 1.0x normal .. 3.0x fast)
+    // =========================================================================
+
+    virtual double GetMotionSpeedScale() const {
+        return motion_speed_scale_.load(std::memory_order_relaxed);
+    }
+
+    virtual void SetMotionSpeedScale(double scale) {
+        motion_speed_scale_.store(std::clamp(scale, 0.1, 3.0), std::memory_order_relaxed);
+    }
+
+    // Adjust motion speed scale by delta ([ = -0.1, \ = +0.1), clipped to [0.1, 3.0]
+    virtual void AdjustMotionSpeedScale(double delta) {
+        double cur = motion_speed_scale_.load(std::memory_order_relaxed);
+        double next = std::clamp(cur + delta, 0.1, 3.0);
+        motion_speed_scale_.store(next, std::memory_order_relaxed);
+        std::cout << "[SpeedCtrl] Motion speed: " << cur << "x -> " << next << "x" << std::endl;
     }
 
     // ------------------------------------------------------------------
@@ -496,6 +517,11 @@ protected:
     /// Adjusted via keyboard (X = +0.1, C = −0.1), clamped to [0.2, 1.0].
     /// 1.0 = fully closed allowed (default); use --max-close-ratio CLI arg to limit.
     std::atomic<double> max_close_ratio_{1.0};
+
+    /// Keyboard-controlled motion playback speed scale.
+    /// Adjusted via keyboard ([ = −0.1, \ = +0.1), clamped to [0.1, 3.0].
+    /// 1.0 = normal speed (default).
+    std::atomic<double> motion_speed_scale_{1.0};
 
     /// Shared stdin buffer – the InterfaceManager pushes non-manager keys here
     /// for the currently-active interface to consume via ReadStdinChar().
